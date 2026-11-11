@@ -18,7 +18,7 @@ const api: DesktopAPI = {
       tools: installationId => ipcRenderer.invoke('beings:home-connector-tools', installationId),
       setTool: (installationId, input) => ipcRenderer.invoke('beings:home-connector-set-tool', installationId, input),
       setBeingAccess: (installationId, enabled, expectedRevision) => ipcRenderer.invoke('beings:home-connector-being-access', installationId, enabled, expectedRevision),
-      lifecycle: (installationId, action, expectedRevision) => ipcRenderer.invoke('beings:home-connector-lifecycle', installationId, action, expectedRevision),
+      lifecycle: (installationId, action, expectedRevision, requestId) => ipcRenderer.invoke('beings:home-connector-lifecycle', installationId, action, expectedRevision, requestId),
     },
     files: {
       list: path => ipcRenderer.invoke('beings:home-files-list', path),

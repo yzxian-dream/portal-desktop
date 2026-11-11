@@ -6,6 +6,7 @@ import type { ClientErrorLog } from './error-log';
 import type { Exclusive } from './mutations';
 import { createMainWindow } from './window';
 import { windowPresentation } from './window-presentation';
+import { isBeingAppReturn, registerBeingAppProtocol } from './deep-link';
 
 interface LifecycleOptions {
   clientName: string;
@@ -38,6 +39,10 @@ export class DesktopLifecycle {
   constructor(private options: LifecycleOptions) { }
 
   start(ready: () => Promise<void>) {
+    app.on('open-url', (event, url) => {
+      event.preventDefault();
+      if (isBeingAppReturn(url)) this.showWindow();
+    });
     app.on('browser-window-created', (_event, window) => { windowPresentation(window); });
     app.on('second-instance', (_event, argv) => {
       const args = argv ?? [];
@@ -48,9 +53,14 @@ export class DesktopLifecycle {
         return;
       }
       if (args.includes('--quit-for-update')) { app.quit(); return; }
+      const returnUrl = args.find(arg => arg.startsWith('being-app:'));
+      if (returnUrl && !isBeingAppReturn(returnUrl)) return;
       this.showWindow();
     });
-    app.whenReady().then(ready).catch(async error => {
+    app.whenReady().then(async () => {
+      if (!registerBeingAppProtocol()) this.options.errorLog.info('app-protocol', '应用返回链接注册失败，可手动返回客户端。');
+      await ready();
+    }).catch(async error => {
       dialog.showErrorBox(`${this.options.clientName} 启动失败`, this.options.errorLog.report('client-startup', error, '客户端启动失败，请查看日志后重试。'));
       await this.options.errorLog.flush(); app.quit();
     });

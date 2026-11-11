@@ -11,6 +11,9 @@ export function homeErrorMessage(status: number, code = '') {
   if (code === 'insufficient_scope') return 'Home 登录缺少所需权限，请在「电脑」栏退出 Home 后重新登录，授权全部权限。';
   if (code === 'invalid_grant' || status === 401) return '登录已过期，请重新连接 Being Home。';
   if (status === 403) return '当前账号没有所需权限，请重新连接并授权。';
+  if (status === 409 && code === 'kit_installation_plan_changed') return '应用安装计划已变化或与已有安装冲突，尚未完成连接（kit_installation_plan_changed）。';
+  if (status === 409 && code === 'kit_operation_in_progress') return '此应用正在安装或卸载，请等待完成后刷新状态（kit_operation_in_progress）。';
+  if (status === 409 && code.startsWith('kit_')) return `应用连接或安装状态发生冲突，尚未完成操作（${code}）。`;
   if (status === 409) return '电脑或账号正在处理其他操作，请刷新状态后重试。';
   if (status === 429) return '请求过于频繁，请稍后重试。';
   if (status === 507) return '云端存储空间已满。';

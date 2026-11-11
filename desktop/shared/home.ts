@@ -32,6 +32,7 @@ export interface HomeAPI {
 }
 
 export interface HomeConnectorCatalogItem {
+  icon_url?: string | null;
   release_id: string;
   kit_id: string;
   name: string;
@@ -77,6 +78,7 @@ export interface HomeConnectorAccount {
 }
 export interface HomeConnectorField { name: string; label?: string; type?: string; required?: boolean; secret?: boolean; description?: string | null; placeholder?: string | null }
 export interface HomeConnectorDetail {
+  icon_url?: string | null;
   name: string;
   accounts: HomeConnectorAccount[];
   methods: { method: 'oauth2' | 'api_key' | 'custom_credential'; fields: HomeConnectorField[] }[];
@@ -110,7 +112,7 @@ export interface HomeConnectorAPI {
   tools(installationId: string): Promise<HomeConnectorTool[]>;
   setTool(installationId: string, input: { component_id: string; connection_id: string; export: string; contract_digest: string; request_id: string; expected_revision: number; enabled: boolean; confirm_write: boolean }): Promise<HomeConnectorTool>;
   setBeingAccess(installationId: string, enabled: boolean, expectedRevision: number): Promise<unknown>;
-  lifecycle(installationId: string, action: 'enable' | 'disable' | 'uninstall', expectedRevision: number): Promise<unknown>;
+  lifecycle(installationId: string, action: 'enable' | 'disable' | 'uninstall', expectedRevision: number, requestId?: string): Promise<unknown>;
 }
 
 export const MAX_HOME_PREVIEW = 8 * 1024 * 1024;

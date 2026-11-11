@@ -576,9 +576,11 @@
   stroke-linejoin: round;
 }
 
-#client-settings-dialog .connector-card-icon svg {
+#client-settings-dialog .connector-card-icon svg,
+#client-settings-dialog .connector-card-icon img {
   width: 24px;
   height: 24px;
+  object-fit: contain;
 }
 
 #client-settings-dialog .connector-card-copy strong {
@@ -677,6 +679,8 @@
 }
 
 #client-settings-dialog .connector-account-row {
+  width: 100%;
+  text-align: left;
   min-height: 58px;
   border-radius: var(--settings-radius);
   background: var(--settings-page);

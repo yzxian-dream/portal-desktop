@@ -24,7 +24,8 @@ try {
   app.setName(CLIENT_ID);
   if (process.platform === 'win32') app.setAppUserModelId(windowsAppId(app.isPackaged));
   app.setAboutPanelOptions({ applicationName: CLIENT_NAME });
-  userData = clientUserData(() => app.getPath('appData'), process.env.PORTAL_DESKTOP_USER_DATA);
+  const returnProfile = process.defaultApp ? process.argv.find(arg => arg.startsWith('--portal-desktop-user-data='))?.slice('--portal-desktop-user-data='.length) : undefined;
+  userData = clientUserData(() => app.getPath('appData'), process.env.PORTAL_DESKTOP_USER_DATA || returnProfile);
   app.setPath('userData', userData);
   app.setPath('sessionData', userData);
 } catch (error) {

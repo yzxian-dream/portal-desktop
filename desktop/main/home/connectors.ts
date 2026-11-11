@@ -4,6 +4,19 @@ import type {
   HomeConnectorFlow, HomeConnectorInstallationPage, HomeConnectorPreview, HomeConnectorSelectionOptions, HomeConnectorTool,
 } from '../../shared/home';
 import type { HomeClient } from './client';
+import { HOME_ORIGIN } from './protocol';
+
+export function connectorIconURL(value: unknown, homeBase = HOME_ORIGIN): string | null {
+  if (typeof value !== 'string' || !value) return null;
+  try {
+    const base = new URL(homeBase.replace(/\/?$/, '/'));
+    const url = new URL(value, base);
+    const prefix = base.pathname + 'assets/connector-icons/';
+    if (url.origin !== base.origin || url.username || url.password || url.search || url.hash ||
+      !url.pathname.startsWith(prefix) || !/^[a-z0-9_-]+\.svg$/.test(url.pathname.slice(prefix.length))) return null;
+    return url.href;
+  } catch { return null; }
+}
 
 const json = (body: unknown): RequestInit => ({
   method: 'POST',
@@ -42,11 +55,12 @@ function flowState(flow: HomeConnectorFlow): HomeConnectorEnableState {
 export class HomeConnectors implements HomeConnectorAPI {
   constructor(private client: HomeClient, private openExternal: (url: string) => Promise<void>) {}
 
-  catalog(query: { q?: string; after?: string } = {}) {
+  async catalog(query: { q?: string; after?: string } = {}) {
     const params = new URLSearchParams({ limit: '20' });
     if (query.q?.trim()) params.set('q', utf8Prefix(query.q.trim(), 100));
     if (query.after) params.set('after', requiredId(query.after, '分页游标'));
-    return this.client.request<HomeConnectorCatalogPage>('/v1/me/kit-catalog?' + params.toString());
+    const page = await this.client.request<HomeConnectorCatalogPage>('/v1/me/kit-catalog?' + params.toString());
+    return { ...page, items: page.items.map(item => ({ ...item, icon_url: connectorIconURL(item.icon_url) })) };
   }
 
   installations(after?: string) {
@@ -55,8 +69,9 @@ export class HomeConnectors implements HomeConnectorAPI {
     return this.client.request<HomeConnectorInstallationPage>('/v1/me/kit-installations?' + params.toString());
   }
 
-  detail(releaseId: string) {
-    return this.client.request<HomeConnectorDetail>('/v1/me/kit-releases/' + encodeURIComponent(requiredId(releaseId, 'release_id')) + '/connector');
+  async detail(releaseId: string) {
+    const detail = await this.client.request<HomeConnectorDetail>('/v1/me/kit-releases/' + encodeURIComponent(requiredId(releaseId, 'release_id')) + '/connector');
+    return { ...detail, icon_url: connectorIconURL(detail.icon_url) };
   }
 
   async startOAuth(releaseId: string, installationId?: string) {
@@ -134,9 +149,9 @@ export class HomeConnectors implements HomeConnectorAPI {
     });
   }
 
-  lifecycle(installationId: string, action: 'enable' | 'disable' | 'uninstall', expectedRevision: number) {
+  lifecycle(installationId: string, action: 'enable' | 'disable' | 'uninstall', expectedRevision: number, requestId: string = randomUUID()) {
     return this.client.request(`/v1/me/kit-installations/${encodeURIComponent(requiredId(installationId, 'installation_id'))}/actions`, {
-      ...json({ action, expected_revision: expectedRevision, request_id: randomUUID() }),
+      ...json({ action, expected_revision: expectedRevision, request_id: requiredId(requestId, 'request_id') }),
     });
   }
 }

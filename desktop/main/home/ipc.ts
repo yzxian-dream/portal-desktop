@@ -31,6 +31,6 @@ export function registerHomeIpc(handle: (channel: string, callback: (...args: an
     handle('beings:home-connector-tools', (installationId: string) => connectors.tools(installationId));
     handle('beings:home-connector-set-tool', (installationId: string, input: Parameters<HomeConnectors['setTool']>[1]) => connectors.setTool(installationId, input));
     handle('beings:home-connector-being-access', (installationId: string, enabled: boolean, expectedRevision: number) => connectors.setBeingAccess(installationId, enabled, expectedRevision));
-    handle('beings:home-connector-lifecycle', (installationId: string, action: 'enable' | 'disable' | 'uninstall', expectedRevision: number) => connectors.lifecycle(installationId, action, expectedRevision));
+    handle('beings:home-connector-lifecycle', (installationId: string, action: 'enable' | 'disable' | 'uninstall', expectedRevision: number, requestId?: string) => connectors.lifecycle(installationId, action, expectedRevision, requestId));
   }
 }

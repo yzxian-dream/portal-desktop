@@ -8,7 +8,7 @@ import { Icon } from '../../shared/icons/icon';
 import { ConnectorIcon } from './connector-icon';
 
 const statusText: Record<string, string> = {
-  awaiting_account: '连接中', needs_auth: '连接中', preparing: '连接中', pending: '连接中', unknown: '连接中', waiting_device: '连接中',
+  awaiting_account: '等待账号授权', needs_auth: '需要重新授权', preparing: '正在准备工具', pending: '连接中', unknown: '结果待确认', waiting_device: '等待设备',
   ready: '已连接', paused: '已停用', disabled: '已停用', removed: '已停用', degraded: '部分不可用',
   failed: '连接失败', cancelled: '连接失败', expired: '连接失败', blocked: '连接失败',
 };
@@ -31,6 +31,8 @@ export function ConnectorSettings({ model }: { model: AppModel }) {
   const [detail, setDetail] = useState<HomeConnectorDetail>();
   const [preview, setPreview] = useState<HomeConnectorPreview>();
   const [flow, setFlow] = useState<HomeConnectorEnableState>();
+  const [selectedInstallation, setSelectedInstallation] = useState<string>();
+  const toolsRequest = useRef(0);
   const [tools, setTools] = useState<HomeConnectorTool[]>();
   const [method, setMethod] = useState<string>();
   const [values, setValues] = useState<Record<string, string>>({});
@@ -44,6 +46,10 @@ export function ConnectorSettings({ model }: { model: AppModel }) {
   const navigation = useRef(0);
   const catalogRequest = useRef(0);
   const details = useRef(new Map<string, Promise<HomeConnectorDetail>>());
+  const continuations = useRef(new Map<string, HomeConnectorEnableState>());
+  const pollAttempts = useRef(0);
+  const removals = useRef(new Map<string, Map<string, { revision: number; requestId: string }>>());
+  const advancing = useRef<number | undefined>(undefined);
 
   // Share hover, navigation and connect reads for this settings session.
   const readDetail = (releaseId: string) => {
@@ -65,7 +71,7 @@ export function ConnectorSettings({ model }: { model: AppModel }) {
     setToolsLoading(false); setToolsError(''); setPendingConnection(undefined);
   };
 
-  useEffect(() => () => { navigation.current++; catalogRequest.current++; details.current.clear(); }, [api]);
+  useEffect(() => () => { navigation.current++; catalogRequest.current++; details.current.clear(); continuations.current.clear(); removals.current.clear(); }, [api]);
 
   const load = async (search = query) => {
     if (!api) return;
@@ -75,7 +81,7 @@ export function ConnectorSettings({ model }: { model: AppModel }) {
       const home = await model.api.home?.state();
       if (request !== catalogRequest.current) return;
       setAuthenticated(Boolean(home?.authenticated));
-      if (!home?.authenticated) { setCatalogEnabled(false); setCatalog([]); setInstallations([]); return; }
+      if (!home?.authenticated) { continuations.current.clear(); removals.current.clear(); setCatalogEnabled(false); setCatalog([]); setInstallations([]); return; }
       const [kits, installed] = await Promise.all([
         (async () => {
           const page = await api.catalog(search ? { q: search } : {});
@@ -112,30 +118,32 @@ export function ConnectorSettings({ model }: { model: AppModel }) {
   const availableKits = catalogEnabled ? catalog.filter(item => item.availability === 'listed' && !installedKits.includes(item)) : [];
   const unavailableKits = catalog.filter(item => item.availability !== 'listed' && !installedKits.includes(item));
 
-  const startOAuth = async (kit: HomeConnectorCatalogItem) => {
+  const startOAuth = async (kit: HomeConnectorCatalogItem, accountId?: string) => {
     if (!api) return;
     const request = ++navigation.current;
     setPendingConnection(selected ? undefined : kit.release_id); setConnecting(true); setDetail(undefined); setPreview(undefined); setFlow(undefined); setTools(undefined); setMethod(undefined); setValues({}); setAdopt(false); setNotice(''); setError(''); setBusy(true);
     try {
+      details.current.delete(kit.release_id);
       const kitDetail = await readDetail(kit.release_id);
       if (request !== navigation.current) return;
-      if (!kitDetail.methods.some(item => item.method === 'oauth2')) {
+      const saved = continuations.current.get(kit.release_id);
+      if (saved) {
+        setSelected(kit); setDetail(kitDetail); setFlow(saved); pollAttempts.current = 0;
+        return;
+      }
+      const accounts = kitDetail.accounts.filter(item => item.usable);
+      const hasOAuth = kitDetail.methods.some(item => item.method === 'oauth2');
+      const account = accountId ? accounts.find(item => item.id === accountId) : !hasOAuth && accounts.length === 1 ? accounts[0] : undefined;
+      if (accountId && !account) throw new Error('账号授权已变化，请刷新后重试。');
+      if (!account && !hasOAuth) {
         setSelected(kit);
         setDetail(kitDetail);
         return;
       }
-      const next = await api.startOAuth(kit.release_id);
-      details.current.delete(kit.release_id);
+      const next = await api.preview(kit.release_id, account ? { connection_id: account.id } : { method: 'oauth2' });
       if (request !== navigation.current) return;
-      setSelected(kit);
-      setFlow(next);
-      if (next.authorization_url && next.status !== 'ready') {
-        await api.openAuthorization(next.authorization_url);
-        if (request === navigation.current) setNotice('已打开连接页面。完成后回到这里继续。');
-      } else if (next.status === 'ready') {
-        setNotice('应用已连接。');
-        await load();
-      }
+      setSelected(kit); setDetail(kitDetail); setPreview(next); setMethod(account ? undefined : 'oauth2');
+      if (!next.requires_adoption) await completeFallbackConnection(next.id, false, {}, request, kit);
     } catch (e) {
       if (request === navigation.current) setError(e instanceof Error ? e.message : '无法连接应用。');
     } finally {
@@ -148,11 +156,12 @@ export function ConnectorSettings({ model }: { model: AppModel }) {
     const request = ++navigation.current;
     setPendingConnection(undefined); setSelected(kit); setConnecting(false); setDetail(undefined); setPreview(undefined); setFlow(undefined); setTools(undefined); setMethod(undefined); setValues({}); setAdopt(false); setNotice(''); setError(''); setBusy(true);
     const installation = installations.find(item => item.desired_state !== 'removed' && kit.installation_ids.includes(item.id));
+    setSelectedInstallation(installation?.id);
     // Tools have their own loading/error state and never hold up the detail page.
     if (installation) void loadTools(installation.id);
     try {
       const nextDetail = await readDetail(kit.release_id);
-      if (request === navigation.current) setDetail(nextDetail);
+      if (request === navigation.current) { setDetail(nextDetail); setFlow(continuations.current.get(kit.release_id)); pollAttempts.current = 0; }
     } catch (e) {
       if (request === navigation.current) setError(e instanceof Error ? e.message : '无法读取应用连接选项。');
     } finally {
@@ -160,33 +169,49 @@ export function ConnectorSettings({ model }: { model: AppModel }) {
     }
   };
 
-  const completeFallbackConnection = async (intentId: string, confirmAdopt: boolean, confirmValues: Record<string, string>, request: number) => {
+  const receiveEnableState = async (next: HomeConnectorEnableState, kit: HomeConnectorCatalogItem, request: number) => {
+    if (!api || request !== navigation.current) return;
+    continuations.current.set(kit.release_id, next);
+    setFlow(next);
+    if (next.status === 'ready') {
+      if (!next.installation_id) throw new Error('账号已授权，但尚未确认安装完成，请刷新状态。');
+      continuations.current.delete(kit.release_id);
+      details.current.delete(kit.release_id);
+      setNotice('应用已连接，工具已就绪。');
+      await load();
+      if (request !== navigation.current) return;
+      const nextDetail = await readDetail(kit.release_id);
+      if (request !== navigation.current) return;
+      setDetail(nextDetail);
+      setSelectedInstallation(next.installation_id);
+      void loadTools(next.installation_id);
+    } else setNotice(`当前状态：${statusLabel(next.status)}`);
+  };
+
+  const completeFallbackConnection = async (intentId: string, confirmAdopt: boolean, confirmValues: Record<string, string>, request: number, kit = selected!) => {
     if (!api) return;
     const next = await api.confirm(intentId, { adopt: confirmAdopt, values: confirmValues });
-    details.current.delete(selected!.release_id);
+    details.current.delete(kit.release_id);
     if (request !== navigation.current) return;
-    setValues({}); setPreview(undefined);
-    setFlow(next);
+    setValues({}); setPreview(undefined); pollAttempts.current = 0;
+    await receiveEnableState(next, kit, request);
+    if (request !== navigation.current) return;
     if (next.authorization_url && next.status !== 'ready') {
       await api.openAuthorization(next.authorization_url);
-      if (request === navigation.current) setNotice('已打开连接页面。完成后回到这里继续。');
-    } else if (next.status === 'ready') {
-      setNotice('应用已连接，正在刷新工具列表。');
-      await load();
-      if (request === navigation.current && next.installation_id) await loadTools(next.installation_id);
-    } else setNotice(`当前状态：${statusLabel(next.status)}`);
+      if (request === navigation.current) setNotice('已打开授权页面，完成后会自动安装并准备工具。');
+    }
   };
 
   const beginFallbackConnection = async (input: { method: string }) => {
     if (!api || !selected) return;
     const request = navigation.current;
-    setBusy(true); setError(''); setNotice(''); setMethod(input.method);
+    setBusy(true); setError(''); setNotice(''); setFlow(undefined); setMethod(input.method);
     try {
       const nextPreview = await api.preview(selected.release_id, input);
       if (request !== navigation.current) return;
       const fields = detail?.methods.find(item => item.method === input.method)?.fields || [];
-      if (fields.length > 0 || nextPreview.requires_adoption) setPreview(nextPreview);
-      else await completeFallbackConnection(nextPreview.id, false, {}, request);
+      setPreview(nextPreview);
+      if (!fields.length && !nextPreview.requires_adoption) await completeFallbackConnection(nextPreview.id, false, {}, request);
     } catch (e) { if (request === navigation.current) setError(e instanceof Error ? e.message : '无法创建连接。'); }
     finally { if (request === navigation.current) setBusy(false); }
   };
@@ -201,39 +226,45 @@ export function ConnectorSettings({ model }: { model: AppModel }) {
   };
 
   const advance = async () => {
-    if (!api || !flow) return;
+    if (!api || !flow || !selected || advancing.current === navigation.current) return;
     const request = navigation.current;
+    advancing.current = request;
     setBusy(true); setError('');
     try {
-      let next = flow.revision !== undefined ? await api.syncOAuth(flow.id, flow.revision) : await api.advance(flow.id);
-      if (request !== navigation.current) return;
-      if (next.authorization_url && next.status !== 'ready') { setFlow(next); await api.openAuthorization(next.authorization_url); if (request === navigation.current) setNotice('已打开连接页面。完成后回到这里继续。'); return; }
-      for (let attempt = 0; attempt < 5 && pendingStatuses.includes(next.status); attempt++) {
-        setFlow(next);
-        await new Promise(resolve => setTimeout(resolve, 1200 + attempt * 600));
-        if (request !== navigation.current) return;
-        next = flow.revision !== undefined ? await api.oauthState(flow.id) : await api.state(flow.id);
-        if (request !== navigation.current) return;
-      }
-      if (request !== navigation.current) return;
-      setFlow(next);
-      if (next.status === 'ready') { setNotice('应用已连接，正在刷新工具列表。'); await load(); }
-      else setNotice(`当前状态：${statusLabel(next.status)}`);
+      const next = flow.installation_id ? await api.state(flow.id) : await api.advance(flow.id);
+      await receiveEnableState(next, selected, request);
     } catch (e) { if (request === navigation.current) setError(e instanceof Error ? e.message : '无法继续连接。'); }
-    finally { if (request === navigation.current) setBusy(false); }
+    finally { if (advancing.current === request) advancing.current = undefined; if (request === navigation.current) setBusy(false); }
   };
+
+  useEffect(() => {
+    if (!flow || !selected || busy || error || !['awaiting_account', 'preparing', 'pending', 'waiting_device'].includes(flow.status) || pollAttempts.current >= 45) return;
+    const timer = setTimeout(() => { pollAttempts.current++; void advance(); }, Math.min(1500 + pollAttempts.current * 250, 5000));
+    return () => clearTimeout(timer);
+  }, [flow, selected, busy, error]);
+
+  useEffect(() => {
+    const resume = () => {
+      if (!flow || !selected || busy || error || !['awaiting_account', 'preparing', 'pending', 'waiting_device'].includes(flow.status)) return;
+      pollAttempts.current = 0;
+      void advance();
+    };
+    window.addEventListener('focus', resume);
+    return () => window.removeEventListener('focus', resume);
+  }, [flow, selected, busy, error]);
 
   const loadTools = async (installationId: string) => {
     if (!api) return;
     const request = navigation.current;
-    setToolsLoading(true); setToolsError('');
+    const toolRequest = ++toolsRequest.current;
+    setTools(undefined); setToolsLoading(true); setToolsError('');
     try {
       const nextTools = await api.tools(installationId);
-      if (request === navigation.current) setTools(nextTools);
+      if (request === navigation.current && toolRequest === toolsRequest.current) setTools(nextTools);
     } catch (e) {
-      if (request === navigation.current) setToolsError(e instanceof Error ? e.message : '无法读取工具设置。');
+      if (request === navigation.current && toolRequest === toolsRequest.current) setToolsError(e instanceof Error ? e.message : '无法读取工具设置。');
     } finally {
-      if (request === navigation.current) setToolsLoading(false);
+      if (request === navigation.current && toolRequest === toolsRequest.current) setToolsLoading(false);
     }
   };
 
@@ -251,17 +282,35 @@ export function ConnectorSettings({ model }: { model: AppModel }) {
 
   const changeLifecycle = async (installation: HomeConnectorInstallation, action: 'enable' | 'disable' | 'uninstall') => {
     if (!api) return;
-    if (action === 'uninstall' && !window.confirm('卸载后会停用此应用及其工具，确认继续吗？')) return;
+    const releaseId = selected?.release_id || installation.root_release_id;
+    if (action === 'uninstall' && !removals.current.has(releaseId)) {
+      const targets = installations.filter(item => item.desired_state !== 'removed' && (selected ? selected.installation_ids.includes(item.id) : item.id === installation.id));
+      if (!window.confirm(`卸载此应用的 ${targets.length} 份账号安装并停止工具调用？其他应用不受影响，历史记录保留。`)) return;
+      removals.current.set(releaseId, new Map(targets.map(item => [item.id, { revision: item.revision, requestId: crypto.randomUUID() }])));
+    }
     const request = navigation.current;
+    let submitted = false;
     setBusy(true); setError('');
     try {
-      await api.lifecycle(installation.id, action, installation.revision);
+      if (action === 'uninstall') {
+        const pending = removals.current.get(releaseId)!;
+        for (const [id, request] of pending) {
+          await api.lifecycle(id, action, request.revision, request.requestId);
+          setInstallations(current => current.map(item => item.id === id ? { ...item, desired_state: 'removed', status: 'removed' } : item));
+          pending.delete(id);
+        }
+        removals.current.delete(releaseId);
+      } else await api.lifecycle(installation.id, action, installation.revision);
+      submitted = true;
       details.current.delete(installation.root_release_id);
       if (request !== navigation.current) return;
       await load();
-      if (request === navigation.current && action === 'uninstall') setTools(undefined);
+      if (request !== navigation.current) return;
+      if (action === 'uninstall') { continuations.current.delete(installation.root_release_id); setFlow(undefined); setPreview(undefined); setTools(undefined); }
+      const nextDetail = await readDetail(installation.root_release_id);
+      if (request === navigation.current) setDetail(nextDetail);
     }
-    catch (e) { if (request === navigation.current) setError(e instanceof Error ? e.message : '无法更新应用状态。'); }
+    catch (e) { if (request === navigation.current) setError(submitted ? `操作已提交，但刷新状态失败，请返回列表刷新。${e instanceof Error ? e.message : ''}` : action === 'uninstall' ? `卸载尚未全部确认，请再次点击卸载重试。${e instanceof Error ? e.message : ''}` : e instanceof Error ? e.message : '无法更新应用状态。'); }
     finally { if (request === navigation.current) setBusy(false); }
   };
 
@@ -278,7 +327,7 @@ export function ConnectorSettings({ model }: { model: AppModel }) {
     {selected && (detail || flow) && busy && <ConnectorLoading label="处理中…" />}
     {!catalogLoading && !catalogError && !catalogEnabled && <p className="field-help">当前账号尚未配置可用的应用市场。</p>}
     {notice && <p className="field-help" role="status">{notice}</p>}
-    {selected && !detail && !flow ? <ConnectorLoadingView kit={selected} onBack={back} busy={busy} connecting={connecting} onRetry={() => void (connecting ? startOAuth(selected) : openKit(selected))} /> : selected && !detail && flow ? <ConnectorOAuthFlow kit={selected} flow={flow} busy={busy} onBack={back} onAdvance={() => void advance()} /> : selected && detail ? <ConnectorDetailView kit={selected} detail={detail} preview={preview} flow={flow} method={method} values={values} adopt={adopt} busy={busy} onBack={back} onConnect={() => void startOAuth(selected)} onMethod={method => void beginFallbackConnection({ method })} onValue={(name, value) => setValues(current => ({ ...current, [name]: value }))} onAdopt={setAdopt} onConfirm={() => void confirmFallbackConnection()} onAdvance={() => void advance()} tools={tools} toolsLoading={toolsLoading} toolsError={toolsError} onLoadTools={loadTools} onToggleTool={toggleTool} onLifecycle={changeLifecycle} installations={installations} /> : catalogLoading && !catalog.length ? null : <>
+    {selected && !detail && !flow ? <ConnectorLoadingView kit={selected} onBack={back} busy={busy} connecting={connecting} onRetry={() => void (connecting ? startOAuth(selected) : openKit(selected))} /> : selected && !detail && flow ? <ConnectorOAuthFlow kit={selected} flow={flow} busy={busy} onBack={back} onAdvance={() => { pollAttempts.current = 0; void advance(); }} /> : selected && detail ? <ConnectorDetailView kit={selected} detail={detail} preview={preview} flow={flow} method={method} values={values} adopt={adopt} busy={busy} onBack={back} onConnect={() => void startOAuth(selected)} onAccount={id => void startOAuth(selected, id)} onMethod={method => void beginFallbackConnection({ method })} onValue={(name, value) => setValues(current => ({ ...current, [name]: value }))} onAdopt={setAdopt} onConfirm={() => void confirmFallbackConnection()} onAdvance={() => { pollAttempts.current = 0; void advance(); }} tools={tools} toolsLoading={toolsLoading} toolsError={toolsError} onLoadTools={loadTools} onToggleTool={toggleTool} onLifecycle={changeLifecycle} selectedInstallation={selectedInstallation} onSelectInstallation={id => { setSelectedInstallation(id); void loadTools(id); }} installations={installations} /> : catalogLoading && !catalog.length ? null : <>
       {installedKits.length > 0 && <ConnectorGroup title={`已添加（${installedKits.length}）`} kits={installedKits} installations={installations} pendingConnection={pendingConnection} onOpen={openKit} onConnect={startOAuth} onPrefetch={kit => { void readDetail(kit.release_id).catch(() => {}); }} />}
       <ConnectorGroup title="推荐" kits={availableKits} installations={installations} pendingConnection={pendingConnection} onOpen={openKit} onConnect={startOAuth} onPrefetch={kit => { void readDetail(kit.release_id).catch(() => {}); }} />
       {unavailableKits.length > 0 && <ConnectorGroup title="暂不可用" kits={unavailableKits} installations={installations} pendingConnection={pendingConnection} onOpen={openKit} onConnect={startOAuth} onPrefetch={kit => { void readDetail(kit.release_id).catch(() => {}); }} disabled />}
@@ -298,7 +347,7 @@ function ConnectorGroup({ title, kits, installations, pendingConnection, onOpen,
         open();
       }
     }} aria-label={open ? `查看 ${kit.name} 详情` : undefined} tabIndex={open ? 0 : undefined}>
-      <ConnectorIcon name={kit.name} />
+      <ConnectorIcon iconUrl={kit.icon_url} />
       <div className="connector-card-copy"><strong>{kit.name}</strong>{!installation && (kit.description || disabled) && <small>{disabled ? kit.unavailable_reason || kit.description || '当前不可用。' : kit.description}</small>}{installation && installation.status !== 'ready' && <em>{statusLabel(installation.status)}</em>}</div>
       <button className="connector-card-action" type="button" aria-label={isConnecting ? '连接中…' : installation ? '管理' : disabled ? '暂不可用' : '连接'} title={installation ? '管理应用' : disabled ? '暂不可用' : '连接应用'} disabled={disabled || isConnecting} aria-busy={isConnecting} onClick={event => {
         event.stopPropagation();
@@ -309,7 +358,7 @@ function ConnectorGroup({ title, kits, installations, pendingConnection, onOpen,
 }
 
 function ConnectorOAuthFlow({ kit, flow, busy, onBack, onAdvance }: { kit: HomeConnectorCatalogItem; flow: HomeConnectorEnableState; busy: boolean; onBack: () => void; onAdvance: () => void }) {
-  return <div className="connector-detail"><button className="text-button" type="button" onClick={onBack}>← 返回应用</button><div className="connector-detail-heading"><ConnectorIcon name={kit.name} /><div><h3>{kit.name}</h3><p>{kit.description}</p></div></div><div className="connector-flow"><p className="connector-status">{statusLabel(flow.status)}</p>{flow.authorization_url && <button className="primary" type="button" onClick={onAdvance} disabled={busy}>已完成连接，继续</button>}{!flow.authorization_url && pendingStatuses.includes(flow.status) && <button type="button" onClick={onAdvance} disabled={busy}>刷新状态</button>}{flow.status === 'ready' && <p className="field-help">应用已连接。</p>}</div></div>;
+  return <div className="connector-detail"><button className="text-button" type="button" onClick={onBack}>← 返回应用</button><div className="connector-detail-heading"><ConnectorIcon iconUrl={kit.icon_url} /><div><h3>{kit.name}</h3><p>{kit.description}</p></div></div><div className="connector-flow"><p className="connector-status">{flow.status === 'ready' && !flow.installation_id ? '账号已授权，等待安装' : statusLabel(flow.status)}</p>{flow.authorization_url && <button className="primary" type="button" onClick={onAdvance} disabled={busy}>刷新连接状态</button>}{!flow.authorization_url && (pendingStatuses.includes(flow.status) || flow.status === 'failed' || flow.status === 'ready' && !flow.installation_id) && <button type="button" onClick={onAdvance} disabled={busy}>刷新状态</button>}{flow.status === 'ready' && flow.installation_id && <p className="field-help">应用已连接。</p>}</div></div>;
 }
 
 function ConnectorLoading({ label }: { label: string }) {
@@ -321,25 +370,29 @@ function ConnectorLoading({ label }: { label: string }) {
 }
 
 function ConnectorLoadingView({ kit, onBack, busy, connecting, onRetry }: { kit: HomeConnectorCatalogItem; onBack: () => void; busy: boolean; connecting: boolean; onRetry: () => void }) {
-  return <div className="connector-detail"><button className="text-button" type="button" onClick={onBack}>← 返回应用</button><div className="connector-detail-heading"><ConnectorIcon name={kit.name} /><div><h3>{kit.name}</h3><p>{kit.description}</p></div></div>{busy ? <ConnectorLoading label={connecting ? '正在连接…' : '正在加载…'} /> : <div className="connector-loading"><button type="button" onClick={onRetry}>重试</button></div>}</div>;
+  return <div className="connector-detail"><button className="text-button" type="button" onClick={onBack}>← 返回应用</button><div className="connector-detail-heading"><ConnectorIcon iconUrl={kit.icon_url} /><div><h3>{kit.name}</h3><p>{kit.description}</p></div></div>{busy ? <ConnectorLoading label={connecting ? '正在连接…' : '正在加载…'} /> : <div className="connector-loading"><button type="button" onClick={onRetry}>重试</button></div>}</div>;
 }
 
-function ConnectorDetailView({ kit, detail, preview, flow, method, values, adopt, busy, onBack, onConnect, onMethod, onValue, onAdopt, onConfirm, onAdvance, tools, toolsLoading, toolsError, onLoadTools, onToggleTool, onLifecycle, installations }: {
-  kit: HomeConnectorCatalogItem; detail: HomeConnectorDetail; preview?: HomeConnectorPreview; flow?: HomeConnectorEnableState; method?: string; values: Record<string, string>; adopt: boolean; busy: boolean; onBack: () => void; onConnect: () => void; onMethod: (method: string) => void; onValue: (name: string, value: string) => void; onAdopt: (value: boolean) => void; onConfirm: () => void; onAdvance: () => void; tools?: HomeConnectorTool[]; toolsLoading: boolean; toolsError: string; onLoadTools: (id: string) => void; onToggleTool: (id: string, tool: HomeConnectorTool, enabled: boolean) => void; onLifecycle: (installation: HomeConnectorInstallation, action: 'enable' | 'disable' | 'uninstall') => void; installations: HomeConnectorInstallation[];
+function ConnectorDetailView({ kit, detail, preview, flow, method, values, adopt, busy, onBack, onConnect, onAccount, onMethod, onValue, onAdopt, onConfirm, onAdvance, tools, toolsLoading, toolsError, onLoadTools, onToggleTool, onLifecycle, installations, selectedInstallation, onSelectInstallation }: {
+  selectedInstallation?: string; onSelectInstallation: (id: string) => void;
+  kit: HomeConnectorCatalogItem; detail: HomeConnectorDetail; preview?: HomeConnectorPreview; flow?: HomeConnectorEnableState; method?: string; values: Record<string, string>; adopt: boolean; busy: boolean; onBack: () => void; onConnect: () => void; onAccount: (id: string) => void; onMethod: (method: string) => void; onValue: (name: string, value: string) => void; onAdopt: (value: boolean) => void; onConfirm: () => void; onAdvance: () => void; tools?: HomeConnectorTool[]; toolsLoading: boolean; toolsError: string; onLoadTools: (id: string) => void; onToggleTool: (id: string, tool: HomeConnectorTool, enabled: boolean) => void; onLifecycle: (installation: HomeConnectorInstallation, action: 'enable' | 'disable' | 'uninstall') => void; installations: HomeConnectorInstallation[];
 }) {
-  const installation = installations.find(item => item.desired_state !== 'removed' && kit.installation_ids.includes(item.id));
+  const activeInstallations = installations.filter(item => item.desired_state !== 'removed' && kit.installation_ids.includes(item.id));
+  const installation = activeInstallations.find(item => item.id === selectedInstallation) || activeInstallations[0];
   const [toolsExpanded, setToolsExpanded] = useState(true);
   const enabledTools = tools?.filter(tool => tool.enabled).length || 0;
-  const account = detail.accounts.find(item => item.usable) || detail.accounts[0];
+  const accounts = detail.accounts.filter(item => item.usable);
   const hasOAuth2 = detail.methods.some(item => item.method === 'oauth2');
   const fields = method ? detail.methods.find(item => item.method === method)?.fields || [] : [];
   const fallbackMethods = detail.methods.filter(item => item.method !== 'oauth2');
-  return <div className="connector-detail"><button className="text-button" type="button" onClick={onBack}>← 返回应用</button><div className="connector-detail-heading"><ConnectorIcon name={kit.name} /><div><h3>{detail.name}</h3><p>{kit.description}</p></div></div>
-    {!installation && !flow && !preview && hasOAuth2 && <div className="connector-connect-panel"><h4>连接应用</h4><p>点击连接后将打开应用的 OAuth2 页面，完成一次连接即可使用。</p><button className="primary" type="button" onClick={onConnect} disabled={busy}>连接</button></div>}
-    {!installation && !flow && !preview && !hasOAuth2 && <div className="connector-connect-panel">{fallbackMethods.length ? fallbackMethods.map(item => <button className="connector-option" key={item.method} type="button" onClick={() => onMethod(item.method)} disabled={busy}><strong>{item.method === 'api_key' ? 'API Key' : '自定义凭据'}</strong><small>添加新账号</small></button>) : <p className="field-help">当前没有可用的连接方式。</p>}</div>}
-    {preview && !flow && <div className="connector-preview"><h4>连接 {detail.name}</h4>{fields.map(field => <label className="connector-field" key={field.name}><span>{field.label || field.name}{field.required ? ' *' : ''}</span><input type={field.secret ? 'password' : field.type === 'number' ? 'number' : 'text'} required={field.required} placeholder={field.placeholder || undefined} value={values[field.name] || ''} onChange={event => onValue(field.name, event.target.value)} /><small>{field.description}</small></label>)}{preview.requires_adoption && <label className="connector-adopt"><input type="checkbox" checked={adopt} onChange={event => onAdopt(event.target.checked)} />使用已有账号继续连接</label>}<button className="primary" type="button" disabled={busy || preview.requires_adoption && !adopt || fields.some(field => field.required && !values[field.name]?.trim())} onClick={onConfirm}>连接</button></div>}
-    {installation && <><section className="connector-account"><h4>账户</h4><div className="connector-account-row"><span>{account?.display_name || 'default'}</span><strong>{statusLabel(installation.status)}</strong></div></section><div className="connector-installed-actions"><p>此应用已连接。可管理工具或暂停应用。</p><div className="connector-action-row"><button type="button" onClick={() => onLoadTools(installation.id)} disabled={busy || toolsLoading}>{toolsLoading ? '加载中…' : '刷新工具'}</button>{installation.desired_state !== 'removed' && <button type="button" onClick={() => onLifecycle(installation, installation.desired_state === 'enabled' ? 'disable' : 'enable')} disabled={busy}>{installation.desired_state === 'enabled' ? '暂停' : '恢复'}</button>}<button type="button" onClick={() => onLifecycle(installation, 'uninstall')} disabled={busy || installation.desired_state === 'removed'}>卸载</button></div></div></>}
-    {flow && <div className="connector-flow"><p className="connector-status">{statusLabel(flow.status)}</p>{flow.authorization_url && <button className="primary" type="button" onClick={onAdvance} disabled={busy}>已完成连接，继续</button>}{!flow.authorization_url && pendingStatuses.includes(flow.status) && <button type="button" onClick={onAdvance} disabled={busy}>刷新状态</button>}{flow.status === 'ready' && installation && <button type="button" onClick={() => onLoadTools(installation.id)} disabled={busy}>查看工具</button>}</div>}
+  return <div className="connector-detail"><button className="text-button" type="button" onClick={onBack}>← 返回应用</button><div className="connector-detail-heading"><ConnectorIcon iconUrl={detail.icon_url ?? kit.icon_url} /><div><h3>{detail.name}</h3><p>{kit.description}</p></div></div>
+    {!installation && !flow && !preview && (hasOAuth2 || accounts.length === 1) && <div className="connector-connect-panel"><h4>连接应用</h4><p>{hasOAuth2 ? '点击连接前往第三方选择账号并授权，完成后自动准备应用和工具。' : '连接时将使用已有账号授权，自动准备工具。'}</p><button className="primary" type="button" onClick={onConnect} disabled={busy}>连接</button></div>}
+    {!installation && !flow && !preview && !hasOAuth2 && !accounts.length && <div className="connector-connect-panel">{fallbackMethods.length ? fallbackMethods.map(item => <button className="connector-option" key={item.method} type="button" onClick={() => onMethod(item.method)} disabled={busy}><strong>{item.method === 'api_key' ? 'API Key' : '自定义凭据'}</strong><small>添加新账号</small></button>) : <p className="field-help">当前没有可用的连接方式。</p>}</div>}
+    {!installation && !flow && !preview && !hasOAuth2 && accounts.length > 1 && <div className="connector-connect-panel"><h4>选择连接账号</h4>{accounts.map(item => <button type="button" key={item.id} disabled={busy} onClick={() => onAccount(item.id)}>连接 {item.display_name || item.id}</button>)}</div>}
+    {preview && !flow && <div className="connector-preview"><h4>连接 {detail.name}</h4>{fields.map(field => <label className="connector-field" key={field.name}><span>{field.label || field.name}{field.required ? ' *' : ''}</span><input type={field.secret ? 'password' : field.type === 'number' ? 'number' : 'text'} required={field.required} placeholder={field.placeholder || undefined} value={values[field.name] || ''} onChange={event => onValue(field.name, event.target.value)} /><small>{field.description}</small></label>)}{preview.requires_adoption && <label className="connector-adopt"><input type="checkbox" checked={adopt} onChange={event => onAdopt(event.target.checked)} />允许接管此账号的旧工具入口</label>}<button className="primary" type="button" disabled={busy || preview.requires_adoption && !adopt || fields.some(field => field.required && !values[field.name]?.trim())} onClick={onConfirm}>连接</button></div>}
+    {installation && <><section className="connector-account"><h4>账户</h4>{activeInstallations.map(item => <button type="button" className="connector-account-row" key={item.id} aria-pressed={item.id === installation.id} disabled={busy} onClick={() => onSelectInstallation(item.id)}><span>{detail.accounts.find(account => account.installation_ids.includes(item.id))?.display_name || 'default'}</span><strong>{statusLabel(item.status)}</strong></button>)}
+      {!preview && (!flow || flow.status === 'ready') && (hasOAuth2 ? <button type="button" disabled={busy} onClick={onConnect}>＋ 添加其他账号</button> : fallbackMethods.length > 0 && <details><summary>＋ 添加其他账号</summary>{fallbackMethods.map(item => <button key={item.method} type="button" disabled={busy} onClick={() => onMethod(item.method)}>{item.method === 'api_key' ? 'API Key' : '自定义凭据'}</button>)}</details>)}</section><div className="connector-installed-actions"><p>{installation.status === 'ready' ? '此应用已连接，可管理各账号的工具。' : `当前状态：${statusLabel(installation.status)}`}</p><div className="connector-action-row"><button type="button" onClick={() => onLoadTools(installation.id)} disabled={busy || toolsLoading}>{toolsLoading ? '加载中…' : '刷新工具'}</button><button type="button" onClick={() => onLifecycle(installation, 'uninstall')} disabled={busy || installation.desired_state === 'removed'}>卸载</button></div></div></>}
+    {flow && <div className="connector-flow"><p className="connector-status">{flow.status === 'ready' && !flow.installation_id ? '账号已授权，等待安装' : statusLabel(flow.status)}</p>{flow.authorization_url && <button className="primary" type="button" onClick={onAdvance} disabled={busy}>刷新连接状态</button>}{!flow.authorization_url && (pendingStatuses.includes(flow.status) || flow.status === 'failed' || flow.status === 'ready' && !flow.installation_id) && <button type="button" onClick={onAdvance} disabled={busy}>刷新状态</button>}{flow.status === 'ready' && installation && <button type="button" onClick={() => onLoadTools(installation.id)} disabled={busy}>查看工具</button>}</div>}
     {installation && <section className="connector-tools" aria-label="工具"><button className="connector-tools-toggle" type="button" aria-expanded={toolsExpanded} onClick={() => setToolsExpanded(value => !value)}><span className="connector-tools-heading"><strong>工具</strong><span>{tools ? `已启用 ${enabledTools}/${tools.length} 个` : toolsLoading ? '加载中…' : '加载失败'}</span></span><span className="connector-tools-chevron" aria-hidden="true">{toolsExpanded ? '⌃' : '⌄'}</span></button>{toolsError && <p className="form-error" role="alert">{toolsError}</p>}{toolsExpanded && tools && <div className="connector-tool-list">{tools.map(tool => <label className="connector-tool" key={JSON.stringify([tool.component_id, tool.connection_id, tool.export])}><span>{tool.export}</span><input type="checkbox" checked={tool.enabled} disabled={busy || !tool.available || !tool.account_authorized} onChange={e => onToggleTool(installation.id, tool, e.target.checked)} /></label>)}</div>}</section>}
   </div>;
 }

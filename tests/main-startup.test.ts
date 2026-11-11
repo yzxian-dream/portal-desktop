@@ -11,7 +11,7 @@ vi.mock('electron', async () => {
     setName: vi.fn(), setAppUserModelId: vi.fn(), setAboutPanelOptions: vi.fn(), setPath: vi.fn(),
     getPath: (name: string) => { if (name === 'appData') throw new Error("Failed to get 'appData' path"); return fixture.directory; },
     getAppPath: () => fixture.directory, getVersion: () => '0.1.6',
-    requestSingleInstanceLock: () => true, quit: vi.fn(),
+    requestSingleInstanceLock: () => true, quit: vi.fn(), setAsDefaultProtocolClient: vi.fn(() => true),
     whenReady: () => ({ then: (ready: () => Promise<void>) => (fixture.startup = Promise.resolve().then(ready)) }),
   });
   Object.defineProperty(app, 'isPackaged', { get: () => fixture.packaged });
@@ -73,6 +73,16 @@ it.each(['normal', 'manual installer', 'downloaded update'] as const)('initializ
     expect(createMainWindow).toHaveBeenCalledOnce();
     expect(reuse).toHaveBeenCalledWith([]);
     const window = vi.mocked(createMainWindow).mock.results[0].value.window;
+    const beforeReturn = vi.mocked(window.focus).mock.calls.length;
+    const returnEvent = { preventDefault: vi.fn() };
+    app.emit('open-url', returnEvent, 'being-app://connector/complete');
+    expect(returnEvent.preventDefault).toHaveBeenCalledOnce();
+    expect(window.focus).toHaveBeenCalledTimes(beforeReturn + 1);
+    app.emit('open-url', { preventDefault: vi.fn() }, 'being-app://connector/complete?code=untrusted');
+    app.emit('second-instance', {}, ['portal-desktop.exe', 'being-app://other/complete']);
+    expect(window.focus).toHaveBeenCalledTimes(beforeReturn + 1);
+    app.emit('second-instance', {}, ['portal-desktop.exe', 'being-app://connector/complete']);
+    expect(window.focus).toHaveBeenCalledTimes(beforeReturn + 2);
     window.webContents.mainFrame = { url: 'beings://desktop/' };
     const request = { sender: window.webContents, senderFrame: window.webContents.mainFrame };
     const handlers = new Map(vi.mocked(ipcMain.handle).mock.calls);
